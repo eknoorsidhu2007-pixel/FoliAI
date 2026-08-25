@@ -5,8 +5,9 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from PIL import Image, UnidentifiedImageError
 from torchvision import models, transforms
 
@@ -37,9 +38,13 @@ CONFIDENCE_THRESHOLD = 0.60
 # solid colors often land at ~90%+). Dividing logits by T > 1 softens the
 # distribution so the 60% gate can reject those cases.
 SOFTMAX_TEMPERATURE = 2.5
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
+TOP_K = 3
 UNKNOWN_MESSAGE = (
     "Image does not clearly match any known plant disease class"
 )
+GENERIC_INFERENCE_ERROR = "Unable to process the image. Please try again."
+GENERIC_INVALID_IMAGE = "Uploaded file is not a valid image."
 
 preprocess = transforms.Compose(
     [
@@ -54,12 +59,13 @@ preprocess = transforms.Compose(
 
 app = FastAPI(title="Plant Disease API")
 
+# §1 CORS: only the Next.js origin — never wildcard "*"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept"],
 )
 
 model: Optional[nn.Module] = None
@@ -145,6 +151,22 @@ def startup() -> None:
     model = load_model()
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(_request: Request, exc: Exception):
+    """Never leak raw Python tracebacks to clients."""
+    # Let FastAPI/Starlette handle HTTPException via their dedicated handlers.
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+        )
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": GENERIC_INFERENCE_ERROR},
+    )
+
+
 @app.get("/health")
 def health():
     return {
@@ -154,71 +176,100 @@ def health():
     }
 
 
+def _top_predictions(probabilities: torch.Tensor, k: int = TOP_K) -> list[dict]:
+    values, indices = torch.topk(probabilities, k=min(k, probabilities.numel()))
+    return [
+        {
+            "class_name": CLASS_NAMES[int(idx)],
+            "confidence": float(conf),
+        }
+        for conf, idx in zip(values.tolist(), indices.tolist())
+    ]
+
+
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(request: Request, file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(status_code=503, detail="Model is not loaded")
 
-    # Ensure eval mode + frozen BN running stats on every request (no train leftovers).
+    # §2 Reject oversized uploads early via Content-Length when present.
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="File too large. Maximum upload size is 10MB.",
+                )
+        except ValueError:
+            pass
+
+    # Ensure eval mode + frozen BN running stats on every request.
     model.eval()
 
     try:
-        # Read bytes explicitly so we never reuse a partially-consumed upload stream.
-        contents = await file.read()
+        # §2 Cap bytes read so huge bodies can't fill memory.
+        contents = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(contents) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="File too large. Maximum upload size is 10MB.",
+            )
         if not contents:
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        image.load()
-    except HTTPException:
-        raise
-    except UnidentifiedImageError:
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
 
-    tensor = preprocess(image).unsqueeze(0)
+        # §3 Validate image by decoding pixels — do not trust Content-Type.
+        try:
+            image = Image.open(io.BytesIO(contents))
+            image.load()
+            image = image.convert("RGB")
+        except UnidentifiedImageError:
+            raise HTTPException(status_code=400, detail=GENERIC_INVALID_IMAGE)
+        except OSError:
+            raise HTTPException(status_code=400, detail=GENERIC_INVALID_IMAGE)
 
-    # Debug: confirm each upload yields a distinct preprocessed tensor.
-    print(
-        f"[predict] tensor shape={tuple(tensor.shape)} "
-        f"min={tensor.min().item():.6f} "
-        f"max={tensor.max().item():.6f} "
-        f"mean={tensor.mean().item():.6f}"
-    )
+        tensor = preprocess(image).unsqueeze(0)
 
-    with torch.no_grad():
-        # Softmax MUST use dim=1 (class axis). dim=0 with batch size 1
-        # makes every class probability exactly 1.0 — false 100% confidence.
-        logits = model(tensor)
-        if logits.ndim != 2 or logits.shape[1] != len(CLASS_NAMES):
-            raise HTTPException(
-                status_code=500,
-                detail=f"Unexpected logits shape {tuple(logits.shape)}",
-            )
+        print(
+            f"[predict] tensor shape={tuple(tensor.shape)} "
+            f"min={tensor.min().item():.6f} "
+            f"max={tensor.max().item():.6f} "
+            f"mean={tensor.mean().item():.6f}"
+        )
 
-        probabilities = torch.softmax(logits / SOFTMAX_TEMPERATURE, dim=1)[0]
-        confidence, predicted_idx = torch.max(probabilities, dim=0)
+        with torch.no_grad():
+            # Softmax MUST use dim=1 (class axis). dim=0 with batch size 1
+            # makes every class probability exactly 1.0 — false 100% confidence.
+            logits = model(tensor)
+            if logits.ndim != 2 or logits.shape[1] != len(CLASS_NAMES):
+                logger.error("Unexpected logits shape %s", tuple(logits.shape))
+                raise HTTPException(status_code=500, detail=GENERIC_INFERENCE_ERROR)
 
-    conf_value = float(confidence.item())
-    class_idx = int(predicted_idx.item())
-    print(
-        f"[predict] top_class={CLASS_NAMES[class_idx]} "
-        f"confidence={conf_value:.6f} "
-        f"logit_max={logits.max().item():.6f} "
-        f"logit_min={logits.min().item():.6f}"
-    )
+            probabilities = torch.softmax(logits / SOFTMAX_TEMPERATURE, dim=1)[0]
+            # §4 Top-3 ranked predictions
+            predictions = _top_predictions(probabilities, TOP_K)
+            confidence = predictions[0]["confidence"]
+            class_name = predictions[0]["class_name"]
 
-    if conf_value < CONFIDENCE_THRESHOLD:
+        print(
+            f"[predict] top_class={class_name} "
+            f"confidence={confidence:.6f} "
+            f"logit_max={logits.max().item():.6f} "
+            f"logit_min={logits.min().item():.6f}"
+        )
+
+        matched = confidence >= CONFIDENCE_THRESHOLD
         return {
-            "class_name": None,
-            "confidence": conf_value,
-            "matched": False,
-            "message": UNKNOWN_MESSAGE,
+            "class_name": class_name if matched else None,
+            "confidence": confidence,
+            "matched": matched,
+            "message": None if matched else UNKNOWN_MESSAGE,
+            "predictions": predictions,
         }
 
-    return {
-        "class_name": CLASS_NAMES[class_idx],
-        "confidence": conf_value,
-        "matched": True,
-        "message": None,
-    }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # §3 Generic client-facing error; details stay in server logs.
+        logger.exception("Prediction failed: %s", exc)
+        raise HTTPException(status_code=500, detail=GENERIC_INFERENCE_ERROR)
