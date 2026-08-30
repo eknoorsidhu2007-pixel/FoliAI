@@ -1,6 +1,6 @@
 # FoliAI
 
-[README (3).md](https://github.com/user-attachments/files/31622511/README.3.md)
+
 # 🌿 FoliAI
 
 A plant disease classifier: upload a photo of a leaf, get back the most likely disease (or a clean bill of health) with a confidence score — backed by a fine-tuned ResNet-18 model served over FastAPI, with a Next.js frontend.
